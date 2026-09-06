@@ -1,0 +1,129 @@
+# Cloud Build — git auto-deploy pipeline for CoLab.
+# Fires on every push to `main` (via a Cloud Build trigger) and:
+#   1. builds + pushes the 3 Docker images to Artifact Registry
+#   2. deploys them to the existing (Terraform-managed) Cloud Run services
+#
+# This only SUCCEEDS while the services exist (i.e. while the app is UP).
+# If services are down (after bin/down.sh), this build fails harmlessly.
+#
+# Substitutions are set on the trigger (or via --substitutions when running manually):
+#   _REGION       = asia-south1
+#   _IMAGE_TAG    = latest (or an incrementing tag)
+#   _DATABASE_SECRET = DATABASE_URL
+#   _JWT_SECRET_SECRET = JWT_SECRET
+
+steps:
+  # ---- 1. Build + push the two backends ----
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--platform=linux/amd64"
+      - "--target=http-backend"
+      - "--tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/http-backend:${_IMAGE_TAG}"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/http-backend:${_IMAGE_TAG}"
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--platform=linux/amd64"
+      - "--target=ws-backend"
+      - "--tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/ws-backend:${_IMAGE_TAG}"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/ws-backend:${_IMAGE_TAG}"
+
+  # ---- 2. Deploy backends first so their URLs are known ----
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gcloud run deploy http-backend \
+          --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/http-backend:${_IMAGE_TAG} \
+          --region=${_REGION} --platform=managed --allow-unauthenticated --port=3001 \
+          --cpu=1 --memory=512Mi --min-instances=0 --max-instances=10 \
+          --set-secrets=DATABASE_URL=DATABASE_URL:latest,JWT_SECRET=JWT_SECRET:latest \
+          --set-env-vars=NODE_ENV=production \
+          --project=${PROJECT_ID}
+
+        gcloud run deploy ws-backend \
+          --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/ws-backend:${_IMAGE_TAG} \
+          --region=${_REGION} --platform=managed --allow-unauthenticated --port=8080 \
+          --cpu=1 --memory=512Mi --min-instances=1 --max-instances=5 --no-use-http2 \
+          --set-secrets=DATABASE_URL=DATABASE_URL:latest,JWT_SECRET=JWT_SECRET:latest \
+          --set-env-vars=NODE_ENV=production \
+          --project=${PROJECT_ID}
+
+        echo "backends deployed"
+
+  # ---- 3. Read backend URLs, build frontend with them inlined ----
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        HTTP_URL=$(gcloud run services describe http-backend --region=${_REGION} --platform=managed --format="value(status.url)")
+        WS_URL=$(gcloud run services describe ws-backend --region=${_REGION} --platform=managed --format="value(status.url)" | sed 's/^https:/wss:/')
+        echo "$$HTTP_URL" > /workspace/http_url.txt
+        echo "$$WS_URL" > /workspace/ws_url.txt
+
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        HTTP_URL=$(cat /workspace/http_url.txt)
+        WS_URL=$(cat /workspace/ws_url.txt)
+        docker build \
+          --platform=linux/amd64 \
+          --target=frontend \
+          --build-arg=NEXT_PUBLIC_BACKEND_URL=$$HTTP_URL \
+          --build-arg=NEXT_PUBLIC_WS_URL=$$WS_URL \
+          --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/colab-fe:${_IMAGE_TAG} \
+          .
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/colab-fe:${_IMAGE_TAG}"
+
+  # ---- 4. Deploy frontend + update CORS with the real URL ----
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gcloud run deploy colab-fe \
+          --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/colab-fe:${_IMAGE_TAG} \
+          --region=${_REGION} --platform=managed --allow-unauthenticated --port=3000 \
+          --cpu=1 --memory=512Mi --min-instances=0 --max-instances=10 \
+          --set-env-vars=NODE_ENV=production \
+          --project=${PROJECT_ID}
+
+        FE_URL=$(gcloud run services describe colab-fe --region=${_REGION} --platform=managed --format="value(status.url)")
+        gcloud run services update http-backend \
+          --region=${_REGION} --platform=managed \
+          --set-env-vars=ALLOWED_ORIGINS=$$FE_URL \
+          --project=${PROJECT_ID}
+
+        # Ensure public access (--allow-unauthenticated can be flaky mid-pipeline)
+        for svc in http-backend ws-backend colab-fe; do
+          gcloud run services add-iam-policy-binding $$svc \
+            --region=${_REGION} --platform=managed \
+            --member=allUsers --role=roles/run.invoker \
+            --project=${PROJECT_ID} >/dev/null 2>&1 || true
+        done
+        echo "DONE. Frontend at: $$FE_URL"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+images:
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/http-backend:${_IMAGE_TAG}"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/ws-backend:${_IMAGE_TAG}"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/colab-images/colab-fe:${_IMAGE_TAG}"

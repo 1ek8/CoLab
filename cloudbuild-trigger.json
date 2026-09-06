@@ -1,0 +1,23 @@
+{
+  "name": "colab-auto-deploy",
+  "description": "Auto-deploy CoLab to Cloud Run on push to main (only succeeds while services are UP)",
+  "location": "asia-south1",
+  "triggerTemplate": {
+    "repoName": "CoLab",
+    "branchName": "main"
+  },
+  "filename": "cloudbuild.yaml",
+  "substitutions": {
+    "_REGION": "asia-south1",
+    "_IMAGE_TAG": "latest"
+  },
+  "serviceAccountEmail": "PROJECT_NUMBER-compute@developer.gserviceaccount.com",
+  "includedFiles": [
+    "**"
+  ],
+  "ignoredFiles": [
+    "infra/**",
+    "bin/**",
+    "scripts/**"
+  ]
+}

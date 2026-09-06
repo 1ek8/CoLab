@@ -36,3 +36,17 @@ yarn-error.log*
 # Misc
 .DS_Store
 *.pem
+
+# GCP / Terraform
+bin/.env
+infra/.terraform/
+infra/terraform.tfstate*
+infra/*.tfstate*
+infra/.terraform.lock.hcl
+*.tfvars
+
+# Local deployment runbook (contains personal account details)
+deployment.md
+
+# direnv (per-dir gcloud project)
+.envrc

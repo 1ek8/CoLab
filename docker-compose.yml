@@ -1,0 +1,71 @@
+# Local development stack for CoLab.
+# Usage: docker compose up --build
+# Database will be available at localhost:5432 afterwards.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: colab
+      POSTGRES_PASSWORD: colab
+      POSTGRES_DB: colab
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U colab -d colab"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  http-backend:
+    build:
+      context: .
+      target: http-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://colab:colab@db:5432/colab
+      JWT_SECRET: change-me-in-production
+      ALLOWED_ORIGINS: http://localhost:3000
+      PORT: 3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  ws-backend:
+    build:
+      context: .
+      target: ws-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://colab:colab@db:5432/colab
+      JWT_SECRET: change-me-in-production
+      PORT: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  colab-fe:
+    build:
+      context: .
+      target: frontend
+      args:
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:3001
+        NEXT_PUBLIC_WS_URL: ws://localhost:8080
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - http-backend
+      - ws-backend
+
+volumes:
+  pgdata:
